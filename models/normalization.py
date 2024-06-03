@@ -14,132 +14,235 @@
 # limitations under the License.
 
 """Normalization layers."""
-import flax.linen as nn
-import functools
-import jax.nn.initializers as init
-import jax.numpy as jnp
 
+# import flax.linen as nn
+# import functools
+# import jax.nn.initializers as init
+# import jax.numpy as jnp
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# def get_normalization(config, conditional=False):
+#   """Obtain normalization modules from the config file."""
+#   norm = config.model.normalization
+#   if conditional:
+#     if norm == 'InstanceNorm++':
+#       return functools.partial(ConditionalInstanceNorm2dPlus, num_classes=config.model.num_classes)
+#     else:
+#       raise NotImplementedError(f'{norm} not implemented yet.')
+#   else:
+#     if norm == 'InstanceNorm':
+#       return InstanceNorm2d
+#     elif norm == 'InstanceNorm++':
+#       return InstanceNorm2dPlus
+#     elif norm == 'VarianceNorm':
+#       return VarianceNorm2d
+#     elif norm == 'GroupNorm':
+#       return nn.GroupNorm
+#     else:
+#       raise ValueError('Unknown normalization: %s' % norm)
 
 def get_normalization(config, conditional=False):
-  """Obtain normalization modules from the config file."""
-  norm = config.model.normalization
-  if conditional:
-    if norm == 'InstanceNorm++':
-      return functools.partial(ConditionalInstanceNorm2dPlus, num_classes=config.model.num_classes)
+    norm = config.model.normalization
+    if conditional:
+        if norm == 'InstanceNorm++':
+            return lambda: ConditionalInstanceNorm2dPlus(num_classes=config.model.num_classes)
+        else:
+            raise NotImplementedError(f'{norm} not implemented yet.')
     else:
-      raise NotImplementedError(f'{norm} not implemented yet.')
-  else:
-    if norm == 'InstanceNorm':
-      return InstanceNorm2d
-    elif norm == 'InstanceNorm++':
-      return InstanceNorm2dPlus
-    elif norm == 'VarianceNorm':
-      return VarianceNorm2d
-    elif norm == 'GroupNorm':
-      return nn.GroupNorm
-    else:
-      raise ValueError('Unknown normalization: %s' % norm)
+        if norm == 'InstanceNorm':
+            return InstanceNorm2d
+        elif norm == 'InstanceNorm++':
+            return InstanceNorm2dPlus
+        elif norm == 'VarianceNorm':
+            return VarianceNorm2d
+        elif norm == 'GroupNorm':
+            return nn.GroupNorm
+        else:
+            raise ValueError(f'Unknown normalization: {norm}')
 
 
 class VarianceNorm2d(nn.Module):
-  """Variance normalization for images."""
-  bias: bool = False
+    """Variance normalization for images."""
+    def __init__(self, bias=False):
+        super(VarianceNorm2d, self).__init__()
+        self.bias = bias
+        self.scale = nn.Parameter(torch.randn(1) + 1)
+        if self.bias:
+            self.beta = nn.Parameter(torch.zeros(1))
 
-  @staticmethod
-  def scale_init(key, shape, dtype=jnp.float32):
-    normal_init = init.normal(0.02)
-    return normal_init(key, shape, dtype=dtype) + 1.
+    def forward(self, x):
+        variance = torch.var(x, dim=(1, 2), keepdim=True)
+        h = x / torch.sqrt(variance + 1e-5)
+        h = h * self.scale
+        if self.bias:
+            h = h + self.beta
+        return h
 
-  @nn.compact
-  def __call__(self, x):
-    variance = jnp.var(x, axis=(1, 2), keepdims=True)
-    h = x / jnp.sqrt(variance + 1e-5)
+# class VarianceNorm2d(nn.Module):
+#   """Variance normalization for images."""
+#   bias: bool = False
 
-    h = h * self.param('scale', VarianceNorm2d.scale_init, (1, 1, 1, x.shape[-1]))
-    if self.bias:
-      h = h + self.param('bias', init.zeros, (1, 1, 1, x.shape[-1]))
+#   @staticmethod
+#   def scale_init(key, shape, dtype=jnp.float32):
+#     normal_init = init.normal(0.02)
+#     return normal_init(key, shape, dtype=dtype) + 1.
 
-    return h
+#   @nn.compact
+#   def __call__(self, x):
+#     variance = jnp.var(x, axis=(1, 2), keepdims=True)
+#     h = x / jnp.sqrt(variance + 1e-5)
 
+#     h = h * self.param('scale', VarianceNorm2d.scale_init, (1, 1, 1, x.shape[-1]))
+#     if self.bias:
+#       h = h + self.param('bias', init.zeros, (1, 1, 1, x.shape[-1]))
+
+#     return h
 
 class InstanceNorm2d(nn.Module):
-  """Instance normalization for images."""
-  bias: bool = True
+    """Instance normalization for images."""
+    def __init__(self, bias=True):
+        super(InstanceNorm2d, self).__init__()
+        self.bias = bias
+        self.scale = nn.Parameter(torch.ones(1))
+        if self.bias:
+            self.beta = nn.Parameter(torch.zeros(1))
 
-  @nn.compact
-  def __call__(self, x):
-    mean = jnp.mean(x, axis=(1, 2), keepdims=True)
-    variance = jnp.var(x, axis=(1, 2), keepdims=True)
-    h = (x - mean) / jnp.sqrt(variance + 1e-5)
-    h = h * self.param('scale', init.ones, (1, 1, 1, x.shape[-1]))
-    if self.bias:
-      h = h + self.param('bias', init.zeros, (1, 1, 1, x.shape[-1]))
+    def forward(self, x):
+        mean = torch.mean(x, dim=(1, 2), keepdim=True)
+        variance = torch.var(x, dim=(1, 2), keepdim=True)
+        h = (x - mean) / torch.sqrt(variance + 1e-5)
+        h = h * self.scale
+        if self.bias:
+            h = h + self.beta
+        return h
 
-    return h
+# class InstanceNorm2d(nn.Module):
+#   """Instance normalization for images."""
+#   bias: bool = True
 
+#   @nn.compact
+#   def __call__(self, x):
+#     mean = jnp.mean(x, axis=(1, 2), keepdims=True)
+#     variance = jnp.var(x, axis=(1, 2), keepdims=True)
+#     h = (x - mean) / jnp.sqrt(variance + 1e-5)
+#     h = h * self.param('scale', init.ones, (1, 1, 1, x.shape[-1]))
+#     if self.bias:
+#       h = h + self.param('bias', init.zeros, (1, 1, 1, x.shape[-1]))
+
+#     return h
 
 class InstanceNorm2dPlus(nn.Module):
-  """InstanceNorm++ as proposed in the original NCSN paper."""
-  bias: bool = True
+    """InstanceNorm++ as proposed in the original NCSN paper."""
+    def __init__(self, bias=True):
+        super(InstanceNorm2dPlus, self).__init__()
+        self.bias = bias
+        self.alpha = nn.Parameter(torch.randn(1) + 1)
+        self.gamma = nn.Parameter(torch.randn(1) + 1)
+        if self.bias:
+            self.beta = nn.Parameter(torch.zeros(1))
 
-  @staticmethod
-  def scale_init(key, shape, dtype=jnp.float32):
-    normal_init = init.normal(0.02)
-    return normal_init(key, shape, dtype=dtype) + 1.
+    def forward(self, x):
+        means = torch.mean(x, dim=(1, 2))
+        m = torch.mean(means, dim=-1, keepdim=True)
+        v = torch.var(means, dim=-1, keepdim=True)
+        means_plus = (means - m) / torch.sqrt(v + 1e-5)
+        h = (x - means[:, None, None, :]) / torch.sqrt(torch.var(x, dim=(1, 2), keepdim=True) + 1e-5)
+        h = h + means_plus[:, None, None, :] * self.alpha
+        h = h * self.gamma
+        if self.bias:
+            h = h + self.beta
+        return h
 
-  @nn.compact
-  def __call__(self, x):
-    means = jnp.mean(x, axis=(1, 2))
-    m = jnp.mean(means, axis=-1, keepdims=True)
-    v = jnp.var(means, axis=-1, keepdims=True)
-    means_plus = (means - m) / jnp.sqrt(v + 1e-5)
+# class InstanceNorm2dPlus(nn.Module):
+#   """InstanceNorm++ as proposed in the original NCSN paper."""
+#   bias: bool = True
 
-    h = (x - means[:, None, None, :]) / jnp.sqrt(jnp.var(x, axis=(1, 2), keepdims=True) + 1e-5)
+#   @staticmethod
+#   def scale_init(key, shape, dtype=jnp.float32):
+#     normal_init = init.normal(0.02)
+#     return normal_init(key, shape, dtype=dtype) + 1.
 
-    h = h + means_plus[:, None, None, :] * self.param('alpha', InstanceNorm2dPlus.scale_init, (1, 1, 1, x.shape[-1]))
-    h = h * self.param('gamma', InstanceNorm2dPlus.scale_init, (1, 1, 1, x.shape[-1]))
-    if self.bias:
-      h = h + self.param('beta', init.zeros, (1, 1, 1, x.shape[-1]))
+#   @nn.compact
+#   def __call__(self, x):
+#     means = jnp.mean(x, axis=(1, 2))
+#     m = jnp.mean(means, axis=-1, keepdims=True)
+#     v = jnp.var(means, axis=-1, keepdims=True)
+#     means_plus = (means - m) / jnp.sqrt(v + 1e-5)
 
-    return h
+#     h = (x - means[:, None, None, :]) / jnp.sqrt(jnp.var(x, axis=(1, 2), keepdims=True) + 1e-5)
 
+#     h = h + means_plus[:, None, None, :] * self.param('alpha', InstanceNorm2dPlus.scale_init, (1, 1, 1, x.shape[-1]))
+#     h = h * self.param('gamma', InstanceNorm2dPlus.scale_init, (1, 1, 1, x.shape[-1]))
+#     if self.bias:
+#       h = h + self.param('beta', init.zeros, (1, 1, 1, x.shape[-1]))
+
+#     return h
 
 class ConditionalInstanceNorm2dPlus(nn.Module):
-  """Conditional InstanceNorm++ as in the original NCSN paper."""
-  num_classes: int = 10
-  bias: bool = True
+    """Conditional InstanceNorm++ as in the original NCSN paper."""
+    def __init__(self, num_classes=10, bias=True):
+        super(ConditionalInstanceNorm2dPlus, self).__init__()
+        self.num_classes = num_classes
+        self.bias = bias
+        self.embed = nn.Embedding(num_classes, 3 if bias else 2)
 
-  @nn.compact
-  def __call__(self, x, y):
-    means = jnp.mean(x, axis=(1, 2))
-    m = jnp.mean(means, axis=-1, keepdims=True)
-    v = jnp.var(means, axis=-1, keepdims=True)
-    means_plus = (means - m) / jnp.sqrt(v + 1e-5)
-    h = (x - means[:, None, None, :]) / jnp.sqrt(jnp.var(x, axis=(1, 2), keepdims=True) + 1e-5)
-    normal_init = init.normal(0.02)
-    zero_init = init.zeros
-    if self.bias:
-      def init_embed(key, shape, dtype=jnp.float32):
-        feature_size = shape[1] // 3
-        normal = normal_init(
-          key, (shape[0], 2 * feature_size), dtype=dtype) + 1.
-        zero = zero_init(key, (shape[0], feature_size), dtype=dtype)
-        return jnp.concatenate([normal, zero], axis=-1)
+    def forward(self, x, y):
+        means = torch.mean(x, dim=(1, 2))
+        m = torch.mean(means, dim=-1, keepdim=True)
+        v = torch.var(means, dim=-1, keepdim=True)
+        means_plus = (means - m) / torch.sqrt(v + 1e-5)
+        h = (x - means[:, None, None, :]) / torch.sqrt(torch.var(x, dim=(1, 2), keepdim=True) + 1e-5)
 
-      embed = nn.Embed(num_embeddings=self.num_classes, features=x.shape[-1] * 3, embedding_init=init_embed)
-    else:
-      def init_embed(key, shape, dtype=jnp.float32):
-        return normal_init(key, shape, dtype=dtype) + 1.
+        embedding = self.embed(y)
+        if self.bias:
+            gamma, alpha, beta = torch.split(embedding, 1, dim=-1)
+            h = h + means_plus[:, None, None, :] * alpha
+            out = gamma * h + beta
+        else:
+            gamma, alpha = torch.split(embedding, 1, dim=-1)
+            h = h + means_plus[:, None, None, :] * alpha
+            out = gamma * h
 
-      embed = nn.Embed(num_embeddings=self.num_classes, features=x.shape[-1] * 2, embedding_init=init_embed)
+        return out
 
-    if self.bias:
-      gamma, alpha, beta = jnp.split(embed(y), 3, axis=-1)
-      h = h + means_plus[:, None, None, :] * alpha[:, None, None, :]
-      out = gamma[:, None, None, :] * h + beta[:, None, None, :]
-    else:
-      gamma, alpha = jnp.split(embed(y), 2, axis=-1)
-      h = h + means_plus[:, None, None, :] * alpha[:, None, None, :]
-      out = gamma[:, None, None, :] * h
+# class ConditionalInstanceNorm2dPlus(nn.Module):
+#   """Conditional InstanceNorm++ as in the original NCSN paper."""
+#   num_classes: int = 10
+#   bias: bool = True
 
-    return out
+#   @nn.compact
+#   def __call__(self, x, y):
+#     means = jnp.mean(x, axis=(1, 2))
+#     m = jnp.mean(means, axis=-1, keepdims=True)
+#     v = jnp.var(means, axis=-1, keepdims=True)
+#     means_plus = (means - m) / jnp.sqrt(v + 1e-5)
+#     h = (x - means[:, None, None, :]) / jnp.sqrt(jnp.var(x, axis=(1, 2), keepdims=True) + 1e-5)
+#     normal_init = init.normal(0.02)
+#     zero_init = init.zeros
+#     if self.bias:
+#       def init_embed(key, shape, dtype=jnp.float32):
+#         feature_size = shape[1] // 3
+#         normal = normal_init(
+#           key, (shape[0], 2 * feature_size), dtype=dtype) + 1.
+#         zero = zero_init(key, (shape[0], feature_size), dtype=dtype)
+#         return jnp.concatenate([normal, zero], axis=-1)
+
+#       embed = nn.Embed(num_embeddings=self.num_classes, features=x.shape[-1] * 3, embedding_init=init_embed)
+#     else:
+#       def init_embed(key, shape, dtype=jnp.float32):
+#         return normal_init(key, shape, dtype=dtype) + 1.
+
+#       embed = nn.Embed(num_embeddings=self.num_classes, features=x.shape[-1] * 2, embedding_init=init_embed)
+
+#     if self.bias:
+#       gamma, alpha, beta = jnp.split(embed(y), 3, axis=-1)
+#       h = h + means_plus[:, None, None, :] * alpha[:, None, None, :]
+#       out = gamma[:, None, None, :] * h + beta[:, None, None, :]
+#     else:
+#       gamma, alpha = jnp.split(embed(y), 2, axis=-1)
+#       h = h + means_plus[:, None, None, :] * alpha[:, None, None, :]
+#       out = gamma[:, None, None, :] * h
+
+#     return out

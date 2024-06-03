@@ -15,132 +15,161 @@
 
 """Utility functions for computing FID/Inception scores."""
 
-import jax
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+import torchvision.models as models
 import numpy as np
-import six
-import tensorflow as tf
-import tensorflow_gan as tfgan
-import tensorflow_hub as tfhub
+from scipy import linalg
+from torch.utils.data import DataLoader
+from torchvision.datasets import CIFAR10, CelebA, LSUN
+import os
 
-INCEPTION_TFHUB = 'https://tfhub.dev/tensorflow/tfgan/eval/inception/1'
 INCEPTION_OUTPUT = 'logits'
 INCEPTION_FINAL_POOL = 'pool_3'
-_DEFAULT_DTYPES = {
-  INCEPTION_OUTPUT: tf.float32,
-  INCEPTION_FINAL_POOL: tf.float32
-}
 INCEPTION_DEFAULT_IMAGE_SIZE = 299
 
+class InceptionV3(nn.Module):
+    """Pretrained InceptionV3 model returning pool3 and logits."""
+    def __init__(self, transform_input=False):
+        super(InceptionV3, self).__init__()
+        self.model = models.inception_v3(pretrained=True, transform_input=transform_input)
+        self.model.fc = nn.Identity()  # Remove the final fully connected layer
 
-def get_inception_model(inceptionv3=False):
-  if inceptionv3:
-    return tfhub.load(
-      'https://tfhub.dev/google/imagenet/inception_v3/feature_vector/4')
-  else:
-    return tfhub.load(INCEPTION_TFHUB)
+    def forward(self, x):
+        x = self.model(x)
+        pool3 = F.adaptive_avg_pool2d(x, (1, 1)).view(x.size(0), -1)
+        return {'pool_3': pool3, 'logits': x}
 
+def get_inception_model():
+    model = InceptionV3()
+    model.eval()
+    return model
 
 def load_dataset_stats(config):
-  """Load the pre-computed dataset statistics."""
-  if config.data.dataset == 'CIFAR10':
-    filename = 'assets/stats/cifar10_stats.npz'
-  elif config.data.dataset == 'CELEBA':
-    filename = 'assets/stats/celeba_stats.npz'
-  elif config.data.dataset == 'LSUN':
-    filename = f'assets/stats/lsun_{config.data.category}_{config.data.image_size}_stats.npz'
-  else:
-    raise ValueError(f'Dataset {config.data.dataset} stats not found.')
+    """Load the pre-computed dataset statistics."""
+    if config.data.dataset == 'CIFAR10':
+        filename = 'assets/stats/cifar10_stats.npz'
+    elif config.data.dataset == 'CELEBA':
+        filename = 'assets/stats/celeba_stats.npz'
+    elif config.data.dataset == 'LSUN':
+        filename = f'assets/stats/lsun_{config.data.category}_{config.data.image_size}_stats.npz'
+    else:
+        raise ValueError(f'Dataset {config.data.dataset} stats not found.')
 
-  with tf.io.gfile.GFile(filename, 'rb') as fin:
-    stats = np.load(fin)
-    return stats
+    with open(filename, 'rb') as fin:
+        stats = np.load(fin)
+        return stats
 
+def calculate_frechet_distance(mu1, sigma1, mu2, sigma2):
+    """Numpy implementation of the Frechet Distance."""
+    diff = mu1 - mu2
+    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
 
-def classifier_fn_from_tfhub(output_fields, inception_model,
-                             return_tensor=False):
-  """Returns a function that can be as a classifier function.
+    return diff.dot(diff) + np.trace(sigma1 + sigma2 - 2 * covmean)
 
-  Copied from tfgan but avoid loading the model each time calling _classifier_fn
+def get_activations(dataloader, model, device, num_batches=None):
+    """Get activations for the InceptionV3 model."""
+    model.to(device)
+    model.eval()
 
-  Args:
-    output_fields: A string, list, or `None`. If present, assume the module
-      outputs a dictionary, and select this field.
-    inception_model: A model loaded from TFHub.
-    return_tensor: If `True`, return a single tensor instead of a dictionary.
+    activations = []
+    for i, (images, _) in enumerate(dataloader):
+        if num_batches is not None and i >= num_batches:
+            break
+        images = images.to(device)
+        with torch.no_grad():
+            output = model(images)
+            activations.append(output['pool_3'].cpu().numpy())
 
-  Returns:
-    A one-argument function that takes an image Tensor and returns outputs.
-  """
-  if isinstance(output_fields, six.string_types):
-    output_fields = [output_fields]
+    activations = np.concatenate(activations, axis=0)
+    return activations
 
-  def _classifier_fn(images):
-    output = inception_model(images)
-    if output_fields is not None:
-      output = {x: output[x] for x in output_fields}
-    if return_tensor:
-      assert len(output) == 1
-      output = list(output.values())[0]
-    return tf.nest.map_structure(tf.compat.v1.layers.flatten, output)
+def calculate_inception_score(dataloader, model, device, num_splits=10):
+    """Calculate the Inception Score."""
+    model.to(device)
+    model.eval()
 
-  return _classifier_fn
+    preds = []
+    for images, _ in dataloader:
+        images = images.to(device)
+        with torch.no_grad():
+            output = model(images)
+            preds.append(F.softmax(output['logits'], dim=1).cpu().numpy())
 
+    preds = np.concatenate(preds, axis=0)
+    scores = []
+    for i in range(num_splits):
+        part = preds[(i * preds.shape[0] // num_splits):((i + 1) * preds.shape[0] // num_splits), :]
+        kl_div = part * (np.log(part) - np.log(np.expand_dims(np.mean(part, 0), 0)))
+        kl_div = np.mean(np.sum(kl_div, 1))
+        scores.append(np.exp(kl_div))
 
-@tf.function
-def run_inception_jit(inputs,
-                      inception_model,
-                      num_batches=1,
-                      inceptionv3=False):
-  """Running the inception network. Assuming input is within [0, 255]."""
-  if not inceptionv3:
-    inputs = (tf.cast(inputs, tf.float32) - 127.5) / 127.5
-  else:
-    inputs = tf.cast(inputs, tf.float32) / 255.
+    return np.mean(scores), np.std(scores)
 
-  return tfgan.eval.run_classifier_fn(
-    inputs,
-    num_batches=num_batches,
-    classifier_fn=classifier_fn_from_tfhub(None, inception_model),
-    dtypes=_DEFAULT_DTYPES)
+def calculate_fid(dataloader, model, real_stats, device, num_batches=None):
+    """Calculate the FID score."""
+    real_mu, real_sigma = real_stats['mu'], real_stats['sigma']
+    activations = get_activations(dataloader, model, device, num_batches=num_batches)
+    mu = np.mean(activations, axis=0)
+    sigma = np.cov(activations, rowvar=False)
+    fid = calculate_frechet_distance(real_mu, real_sigma, mu, sigma)
+    return fid
 
+def get_data_loader(dataset_name, batch_size, image_size):
+    """Create data loaders for training and evaluation."""
+    if dataset_name == 'CIFAR10':
+        transform = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+        dataset = CIFAR10(root='./data', train=True, download=True, transform=transform)
+    elif dataset_name == 'CELEBA':
+        transform = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+        dataset = CelebA(root='./data', split='train', download=True, transform=transform)
+    elif dataset_name == 'LSUN':
+        transform = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+        dataset = LSUN(root='./data', classes=['bedroom_train'], transform=transform)
+    else:
+        raise NotImplementedError(f'Dataset {dataset_name} not supported.')
 
-@tf.function
-def run_inception_distributed(input_tensor,
-                              inception_model,
-                              num_batches=1,
-                              inceptionv3=False):
-  """Distribute the inception network computation to all available TPUs.
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    return dataloader
 
-  Args:
-    input_tensor: The input images. Assumed to be within [0, 255].
-    inception_model: The inception network model obtained from `tfhub`.
-    num_batches: The number of batches used for dividing the input.
-    inceptionv3: If `True`, use InceptionV3, otherwise use InceptionV1.
+# Example usage
+if __name__ == "__main__":
+    class Config:
+        class Data:
+            dataset = 'CIFAR10'
+            category = 'bedroom'
+            image_size = 64
 
-  Returns:
-    A dictionary with key `pool_3` and `logits`, representing the pool_3 and
-      logits of the inception network respectively.
-  """
-  num_tpus = jax.local_device_count()
-  input_tensors = tf.split(input_tensor, num_tpus, axis=0)
-  pool3 = []
-  logits = [] if not inceptionv3 else None
-  device_format = '/TPU:{}' if 'TPU' in str(jax.devices()[0]) else '/GPU:{}'
-  for i, tensor in enumerate(input_tensors):
-    with tf.device(device_format.format(i)):
-      tensor_on_device = tf.identity(tensor)
-      res = run_inception_jit(
-        tensor_on_device, inception_model, num_batches=num_batches,
-        inceptionv3=inceptionv3)
+        data = Data()
+        training = True
 
-      if not inceptionv3:
-        pool3.append(res['pool_3'])
-        logits.append(res['logits'])  # pytype: disable=attribute-error
-      else:
-        pool3.append(res)
+    config = Config()
 
-  with tf.device('/CPU'):
-    return {
-      'pool_3': tf.concat(pool3, axis=0),
-      'logits': tf.concat(logits, axis=0) if not inceptionv3 else None
-    }
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = get_inception_model()
+    real_stats = load_dataset_stats(config)
+    dataloader = get_data_loader(config.data.dataset, batch_size=32, image_size=config.data.image_size)
+    
+    fid = calculate_fid(dataloader, model, real_stats, device)
+    print(f"FID: {fid}")
+
+    inception_score_mean, inception_score_std = calculate_inception_score(dataloader, model, device)
+    print(f"Inception Score: {inception_score_mean} ± {inception_score_std}")
